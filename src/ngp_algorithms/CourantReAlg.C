@@ -8,22 +8,28 @@
 //
 
 #include <limits>
+#include <type_traits>
 
 #include "ngp_algorithms/CourantReAlg.h"
 #include "BuildTemplates.h"
 #include "master_element/MasterElement.h"
 #include "master_element/MasterElementRepo.h"
 #include "ngp_algorithms/CourantReAlgDriver.h"
+#include "CourantReAlgGpuKernels.h"
+
+#if !defined(KOKKOS_ENABLE_HIP)
 #include "ngp_algorithms/CourantReReduceHelper.h"
 #include "ngp_utils/NgpLoopUtils.h"
 #include "ngp_utils/NgpFieldOps.h"
 #include "ngp_utils/NgpReduceUtils.h"
 #include "ngp_utils/NgpFieldManager.h"
-#include "Realm.h"
 #include "ScratchViews.h"
+#include <stk_mesh/base/NgpMesh.hpp>
+#endif
+
+#include "Realm.h"
 #include "SolutionOptions.h"
 #include "utils/StkHelpers.h"
-#include <stk_mesh/base/NgpMesh.hpp>
 
 namespace sierra {
 namespace kynema_ugf {
@@ -63,9 +69,23 @@ template <typename AlgTraits>
 void
 CourantReAlg<AlgTraits>::execute()
 {
+  const auto& meshInfo = realm_.mesh_info();
+
+  const stk::mesh::Selector sel = realm_.meta_data().locally_owned_part() &
+                                  stk::mesh::selectUnion(partVec_) &
+                                  !(realm_.get_inactive_selector());
+
+#if defined(KOKKOS_ENABLE_HIP)
+  using MeshInfoType = std::decay_t<decltype(meshInfo)>;
+  const CflRe cflReMax =
+    CourantReAlgGpuKernelLauncher<AlgTraits, MeshInfoType>::execute(
+      meshInfo, sel, coordinates_, velocity_, density_, viscosity_, elemCFL_,
+      elemRe_, realm_.get_time_step());
+
+  algDriver_.update_max_cfl_rey(cflReMax.max_cfl, cflReMax.max_re);
+#else
   using ElemSimdDataType = kynema_ugf_ngp::ElemSimdData<stk::mesh::NgpMesh>;
 
-  const auto& meshInfo = realm_.mesh_info();
   const auto& ngpMesh = meshInfo.ngp_mesh();
   const auto& fieldMgr = meshInfo.ngp_field_manager();
   auto& ngpCFL = fieldMgr.template get_field<double>(elemCFL_);
@@ -85,102 +105,6 @@ CourantReAlg<AlgTraits>::execute()
   const auto cflOps = kynema_ugf_ngp::simd_elem_field_updater(ngpMesh, ngpCFL);
   const auto reyOps = kynema_ugf_ngp::simd_elem_field_updater(ngpMesh, ngpRe);
 
-  const stk::mesh::Selector sel = realm_.meta_data().locally_owned_part() &
-                                  stk::mesh::selectUnion(partVec_) &
-                                  !(realm_.get_inactive_selector());
-
-#if defined(KOKKOS_ENABLE_HIP)
-  double cflMax = 0.0;
-  Kokkos::Max<double> cflReducer(cflMax);
-
-  double reMax = 0.0;
-  Kokkos::Max<double> reReducer(reMax);
-
-  const std::string algNameCFL =
-    "CourantReAlg_CFL_" + std::to_string(AlgTraits::topo_);
-  const std::string algNameRE =
-    "CourantReAlg_RE_" + std::to_string(AlgTraits::topo_);
-
-  kynema_ugf_ngp::run_elem_par_reduce(
-    algNameCFL, meshInfo, stk::topology::ELEM_RANK, elemData_, sel,
-    KOKKOS_LAMBDA(ElemSimdDataType & edata, double& cflMax) {
-      auto& scrViews = edata.simdScrView;
-      const auto& v_coords = scrViews.get_scratch_view_2D(coordID);
-      const auto& v_vel = scrViews.get_scratch_view_2D(velID);
-
-      DoubleType elemCFL = -1.0;
-
-      const int* lrscv = meSCS->adjacentNodes();
-      for (int ip = 0; ip < numScsIp; ++ip) {
-        const int il = lrscv[2 * ip];
-        const int ir = lrscv[2 * ip + 1];
-
-        DoubleType udotx = 0.0;
-        DoubleType dxSq = 0.0;
-        for (int d = 0; d < nDim; ++d) {
-          DoubleType uIp = 0.5 * (v_vel(ir, d) + v_vel(il, d));
-          DoubleType dxj = (v_coords(ir, d) - v_coords(il, d));
-          udotx += dxj * uIp;
-          dxSq += dxj * dxj;
-        }
-
-        udotx = stk::math::abs(udotx);
-        const DoubleType cflIp = stk::math::abs(udotx * dt / dxSq);
-
-        elemCFL = stk::math::max(elemCFL, cflIp);
-      }
-      cflOps(edata, 0) = elemCFL;
-
-      for (int i = 0; i < edata.numSimdElems; ++i) {
-        cflMax = stk::math::max(cflMax, elemCFL[i]);
-      }
-    },
-    cflReducer);
-
-  kynema_ugf_ngp::run_elem_par_reduce(
-    algNameRE, meshInfo, stk::topology::ELEM_RANK, elemData_, sel,
-    KOKKOS_LAMBDA(ElemSimdDataType & edata, double& reMax) {
-      auto& scrViews = edata.simdScrView;
-      const auto& v_coords = scrViews.get_scratch_view_2D(coordID);
-      const auto& v_vel = scrViews.get_scratch_view_2D(velID);
-      const auto& v_rho = scrViews.get_scratch_view_1D(rhoID);
-      const auto& v_visc = scrViews.get_scratch_view_1D(viscID);
-
-      DoubleType elemRe = -1.0;
-
-      const int* lrscv = meSCS->adjacentNodes();
-      for (int ip = 0; ip < numScsIp; ++ip) {
-        const int il = lrscv[2 * ip];
-        const int ir = lrscv[2 * ip + 1];
-
-        DoubleType udotx = 0.0;
-        DoubleType dxSq = 0.0;
-        for (int d = 0; d < nDim; ++d) {
-          DoubleType uIp = 0.5 * (v_vel(ir, d) + v_vel(il, d));
-          DoubleType dxj = (v_coords(ir, d) - v_coords(il, d));
-          udotx += dxj * uIp;
-          dxSq += dxj * dxj;
-        }
-
-        udotx = stk::math::abs(udotx);
-
-        const DoubleType diffIp =
-          0.5 * (v_visc(il) / v_rho(il) + v_visc(ir) / v_rho(ir)) + small;
-        const DoubleType reyIp = udotx / diffIp;
-
-        elemRe = stk::math::max(elemRe, reyIp);
-      }
-      reyOps(edata, 0) = elemRe;
-
-      for (int i = 0; i < edata.numSimdElems; ++i) {
-        reMax = stk::math::max(reMax, elemRe[i]);
-      }
-    },
-    reReducer);
-
-  // Accumulate max values for all topology types
-  algDriver_.update_max_cfl_rey(cflMax, reMax);
-#else
   CflRe cflReMax;
   CflReMax<> reducer(cflReMax);
 
@@ -234,10 +158,10 @@ CourantReAlg<AlgTraits>::execute()
 
   // Accumulate max values for all topology types
   algDriver_.update_max_cfl_rey(cflReMax.max_cfl, cflReMax.max_re);
-#endif
 
   ngpCFL.modify_on_device();
   ngpRe.modify_on_device();
+#endif
 }
 
 INSTANTIATE_KERNEL(CourantReAlg)

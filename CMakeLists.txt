@@ -31,6 +31,9 @@ option(KYNEMA_UGF_SAVE_GOLDS  "Save gold files to directory when running tests" 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_STANDARD_REQUIRED)
+set(CMAKE_HIP_STANDARD 20)
+set(CMAKE_HIP_EXTENSIONS OFF)
+set(CMAKE_HIP_STANDARD_REQUIRED ON)
 
 if(NOT ENABLE_HYPRE AND NOT ENABLE_TRILINOS_SOLVERS)
   message(FATAL_ERROR "Hypre and Trilinos-solvers both disabled, must enable at least one or the other.")
@@ -66,9 +69,23 @@ if(ENABLE_CUDA)
 endif()
 
 if(ENABLE_ROCM)
+  if(GPU_TARGETS)
+    set(CMAKE_HIP_ARCHITECTURES ${GPU_TARGETS})
+  endif()
+  enable_language(HIP)
   find_package(hip REQUIRED)
   message(STATUS "Found HIP = ${HIP_PATH}")
   target_link_libraries(${kynema_ugf_lib_name} PUBLIC ${HIP_LIBRARIES})
+  if(GPU_TARGETS)
+    foreach(kynema_ugf_rocm_target IN ITEMS ${kynema_ugf_ex_name} ${kynema_ugf_lib_name})
+      set_target_properties(${kynema_ugf_rocm_target} PROPERTIES
+        HIP_ARCHITECTURES "${GPU_TARGETS}")
+    endforeach()
+    if(ENABLE_UNIT_TESTS)
+      set_target_properties(${utest_ex_name} PROPERTIES
+        HIP_ARCHITECTURES "${GPU_TARGETS}")
+    endif()
+  endif()
 endif()
 
 # Handle issues for Power9 builds
@@ -121,8 +138,12 @@ endif()
 ############################ GPU ######################################
 if(ENABLE_CUDA OR ENABLE_ROCM)
   target_compile_definitions(${kynema_ugf_lib_name} PUBLIC USE_STK_SIMD_NONE)
-  separate_arguments(Trilinos_CXX_COMPILER_FLAGS)
-  target_compile_options(${kynema_ugf_lib_name} PUBLIC $<$<COMPILE_LANGUAGE:CXX>:${Trilinos_CXX_COMPILER_FLAGS}>)
+  set(kynema_ugf_trilinos_cxx_compiler_flags ${Trilinos_CXX_COMPILER_FLAGS})
+  separate_arguments(kynema_ugf_trilinos_cxx_compiler_flags)
+  if(ENABLE_CUDA)
+    target_compile_options(${kynema_ugf_lib_name} PUBLIC
+      $<$<COMPILE_LANGUAGE:CXX>:${kynema_ugf_trilinos_cxx_compiler_flags}>)
+  endif()
   if(ENABLE_CUDA)
     target_compile_options(${kynema_ugf_lib_name} PUBLIC $<$<COMPILE_LANGUAGE:CXX>:--expt-relaxed-constexpr>)
     # if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "11.0.194")
@@ -130,7 +151,8 @@ if(ENABLE_CUDA OR ENABLE_ROCM)
     # endif()
   endif()
   if(ENABLE_ROCM)
-    target_compile_options(${kynema_ugf_lib_name} PUBLIC $<$<COMPILE_LANGUAGE:CXX>:-fgpu-rdc -Wno-deprecated-register>)
+    target_compile_options(${kynema_ugf_lib_name} PUBLIC
+      $<$<COMPILE_LANGUAGE:HIP>:-fgpu-rdc;-Wno-deprecated-register;-Wno-return-type>)
   endif()
 endif()
 
@@ -209,6 +231,12 @@ endif()
 find_package(MPI REQUIRED)
 target_link_libraries(${kynema_ugf_lib_name} PUBLIC $<$<BOOL:${MPI_CXX_FOUND}>:MPI::MPI_CXX>)
 target_link_libraries(${kynema_ugf_lib_name} PUBLIC $<$<BOOL:${MPI_Fortran_FOUND}>:MPI::MPI_Fortran>)
+foreach(kynema_ugf_mpi_include IN LISTS
+    MPI_CXX_INCLUDE_DIRS
+    MPI_CXX_ADDITIONAL_INCLUDE_DIRS
+    MPI_CXX_COMPILER_INCLUDE_DIRS)
+  target_include_directories(${kynema_ugf_lib_name} SYSTEM PUBLIC ${kynema_ugf_mpi_include})
+endforeach()
 
 ############################ MATRIXREE #####################################
 if(ENABLE_MATRIXFREE)
@@ -278,7 +306,9 @@ target_include_directories(${kynema_ugf_lib_name} PUBLIC
 # Most linking, etc, is set to PUBLIC for libkynema_ugf, so we merely link to libkynema_ugf for the exes
 target_link_libraries(${kynema_ugf_ex_name} PRIVATE ${kynema_ugf_lib_name})
 if(ENABLE_UNIT_TESTS)
+  find_package(GTest REQUIRED)
   target_link_libraries(${utest_ex_name} PRIVATE ${kynema_ugf_lib_name})
+  target_link_libraries(${utest_ex_name} PRIVATE GTest::gtest)
   target_include_directories(${utest_ex_name} PRIVATE "${CMAKE_SOURCE_DIR}/unit_tests")
 endif()
 
